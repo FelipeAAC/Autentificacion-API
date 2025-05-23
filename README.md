@@ -1,8 +1,8 @@
-# Proyecto FastAPI
+# Proyecto FastAPI-JWT
 
 ## Contenido
 
-Esta es una api creada para testeo del proyecto semestral de integración, posible utilizacion para el proyecto
+Esta es una api creada para autentificación del proyecto semestral de integración, posible utilizacion para el proyecto
 
 ## Instalación:
 
