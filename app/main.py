@@ -1,116 +1,285 @@
-from fastapi import FastAPI, HTTPException, Depends, status
-from fastapi.security import OAuth2PasswordRequestForm
-from fastapi.middleware.cors import CORSMiddleware
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+import oracledb
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from pydantic import BaseModel, EmailStr
-from datetime import datetime, timedelta
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
+from pydantic import BaseModel, Field
+import asyncio # Para ejecutar operaciones de base de datos síncronas en un hilo separado
+from fastapi.middleware.cors import CORSMiddleware # Para manejar CORS con el frontend de Django
 
-# Configuración de seguridad
-SECRET_KEY = "clave-secreta-ferremas"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
+SECRET_KEY = "your-super-secret-key-replace-this-in-production-with-a-random-one"
+ALGORITHM = "HS256" # Algoritmo de encriptación para JWT
+ACCESS_TOKEN_EXPIRE_SECONDS = 60 # Duración del token de acceso en segundos (60 segundos como se solicitó)
 
-# Hashing de contraseñas
+async def get_conexion():
+    try:
+        # Asegúrate que este string de conexión apunta a la BD correcta donde está tu API de autenticación
+        conexion = await asyncio.to_thread(
+            oracledb.connect,
+            user="prueba_api", # Usuario de la BD para la API de autenticación
+            password="prueba_api", # Contraseña del usuario
+            dsn="localhost:1521/orcl" # DSN de la BD
+        )
+        return conexion
+    except oracledb.Error as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error al conectar a la base de datos: {e}"
+        )
+
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-# Conexión a Oracle (ajusta con tus credenciales y TNS)
-DATABASE_URL = "oracle+cx_oracle://prueba:prueba@localhost:1521/prueba"
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(bind=engine)
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
 
-# Modelo de datos
-class ClienteRegistro(BaseModel):
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+class ClienteBase(BaseModel):
+    correo: str = Field(..., example="usuario@example.com")
+    telefono: Optional[str] = Field(None, example="1234567890")
+
+class ClienteCreate(ClienteBase):
+    p_nombre: str = Field(..., example="Juan")
+    s_nombre: Optional[str] = Field(None, example="Carlos")
+    p_apellido: str = Field(..., example="Perez")
+    s_apellido: Optional[str] = Field(None, example="Gomez")
+    clave: str = Field(..., min_length=6, example="passwordsegura")
+
+class ClienteInDB(ClienteBase):
+    id_cliente: int
     p_nombre: str
-    s_nombre: str | None = None
+    s_nombre: Optional[str]
     p_apellido: str
-    s_apellido: str | None = None
-    correo: EmailStr
-    telefono: str | None = None
-    password: str
-    confirm_password: str
+    s_apellido: Optional[str]
+    clave_hash: str
+    activo: str
+
+    class Config:
+        from_attributes = True
 
 class Token(BaseModel):
     access_token: str
-    token_type: str
+    token_type: str = "bearer"
 
-# App
-app = FastAPI()
+class TokenData(BaseModel):
+    correo: Optional[str] = None
+
+app = FastAPI(
+    title="API de Autenticación de Clientes",
+    description="API para el registro y login de clientes usando FastAPI y JWT con OracleDB.",
+    version="1.0.0"
+)
+
+origins = [
+    "http://localhost",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Utilidades de seguridad
-def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
-
-def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
-
-def create_token(data: dict):
-    to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-# Registro de cliente
-@app.post("/auth/registro", status_code=201)
-def registro(cliente: ClienteRegistro):
-    if cliente.password != cliente.confirm_password:
-        raise HTTPException(status_code=400, detail="Las contraseñas no coinciden")
-
-    db = SessionLocal()
+async def get_current_user(token: str = Depends(oauth2_scheme), db_conn: oracledb.Connection = Depends(get_conexion)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="No se pudieron validar las credenciales",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    cursor = None # Definir cursor fuera del try para asegurar su cierre en finally
     try:
-        existe = db.execute(
-            text("SELECT 1 FROM cliente WHERE correo = :correo"),
-            {"correo": cliente.correo.lower()}
-        ).fetchone()
-
-        if existe:
-            raise HTTPException(status_code=400, detail="Correo ya registrado")
-
-        hash_clave = hash_password(cliente.password)
-        db.execute(
-            text("""
-                INSERT INTO cliente (id_cliente, p_nombre, s_nombre, p_apellido, s_apellido,
-                correo, telefono, clave_hash, activo)
-                VALUES (cliente_seq.NEXTVAL, :pn, :sn, :pa, :sa, :correo, :tel, :hash, 'S')
-            """),
-            {
-                "pn": cliente.p_nombre,
-                "sn": cliente.s_nombre,
-                "pa": cliente.p_apellido,
-                "sa": cliente.s_apellido,
-                "correo": cliente.correo.lower(),
-                "tel": cliente.telefono,
-                "hash": hash_clave
-            }
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        correo: str = payload.get("sub")
+        if correo is None:
+            raise credentials_exception
+        token_data = TokenData(correo=correo)
+        
+        cursor = await asyncio.to_thread(db_conn.cursor)
+        await asyncio.to_thread(
+            cursor.execute,
+            """SELECT id_cliente, p_nombre, s_nombre, p_apellido, s_apellido, 
+                      correo, telefono, clave_hash, activo 
+               FROM cliente WHERE correo = :correo""", # Asegúrate que el esquema (PRUEBA_API.) no sea necesario aquí si el usuario de conexión es prueba_api
+            correo=token_data.correo
         )
-        db.commit()
-        return {"message": "Registro exitoso"}
+        row = await asyncio.to_thread(cursor.fetchone)
+        if row is None:
+            raise credentials_exception
+        
+        user_data = {
+            "id_cliente": row[0], "p_nombre": row[1], "s_nombre": row[2],
+            "p_apellido": row[3], "s_apellido": row[4], "correo": row[5],
+            "telefono": row[6], "clave_hash": row[7], "activo": row[8]
+        }
+        return ClienteInDB(**user_data)
+    except JWTError:
+        raise credentials_exception
+    except oracledb.Error as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error de base de datos al obtener usuario: {e}"
+        )
     finally:
-        db.close()
+        if cursor:
+            await asyncio.to_thread(cursor.close)
 
-# Login de cliente
-@app.post("/auth/login", response_model=Token)
-def login(form: OAuth2PasswordRequestForm = Depends()):
-    db = SessionLocal()
+@app.post("/register", response_model=ClienteInDB, status_code=status.HTTP_201_CREATED, summary="Registrar un nuevo cliente")
+async def register_client(client: ClienteCreate, db_conn: oracledb.Connection = Depends(get_conexion)):
+    cursor = None # Definir cursor fuera del try para asegurar su cierre en finally
     try:
-        user = db.execute(
-            text("SELECT id_cliente, clave_hash FROM cliente WHERE correo = :correo AND activo = 'S'"),
-            {"correo": form.username.lower()}
-        ).fetchone()
+        cursor = await asyncio.to_thread(db_conn.cursor)
 
-        if not user or not verify_password(form.password, user[1]):
-            raise HTTPException(status_code=401, detail="Credenciales inválidas")
+        await asyncio.to_thread(
+            cursor.execute,
+            "SELECT COUNT(*) FROM cliente WHERE correo = :correo", # Esquema PRUEBA_API. opcional si el usuario es prueba_api
+            correo=client.correo
+        )
+        count_row = await asyncio.to_thread(cursor.fetchone)
+        if count_row and count_row[0] > 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="El correo ya está registrado"
+            )
 
-        token = create_token({"sub": form.username.lower(), "tipo_usuario": "cliente", "id": user[0]})
-        return {"access_token": token, "token_type": "bearer"}
+        hashed_password = get_password_hash(client.clave)
+        id_cliente_out_var = cursor.var(oracledb.NUMBER)
+
+        sql_insert = """
+            INSERT INTO cliente ( 
+                p_nombre, s_nombre, p_apellido, s_apellido, 
+                correo, telefono, clave_hash, activo
+            ) VALUES (
+                :p_nombre_val, :s_nombre_val, :p_apellido_val, :s_apellido_val, 
+                :correo_val, :telefono_val, :clave_hash_val, 'S'
+            )
+            RETURNING id_cliente INTO :id_cliente_out_bind
+        """
+
+        await asyncio.to_thread(
+            cursor.execute,
+            sql_insert, # Usamos la nueva sentencia SQL
+            p_nombre_val=client.p_nombre, # Cambiado para coincidir con el SQL
+            s_nombre_val=client.s_nombre, # Cambiado para coincidir con el SQL
+            p_apellido_val=client.p_apellido, # Cambiado para coincidir con el SQL
+            s_apellido_val=client.s_apellido, # Cambiado para coincidir con el SQL
+            correo_val=client.correo, # Cambiado para coincidir con el SQL
+            telefono_val=client.telefono, # Cambiado para coincidir con el SQL
+            clave_hash_val=hashed_password, # Cambiado para coincidir con el SQL
+            id_cliente_out_bind=id_cliente_out_var # Cambiado para coincidir con el SQL
+        )
+        await asyncio.to_thread(db_conn.commit)
+
+        new_id_cliente_tuple = id_cliente_out_var.getvalue()
+        if not new_id_cliente_tuple: # Verificación adicional
+             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="No se pudo obtener el ID del cliente generado.")
+        new_id_cliente = new_id_cliente_tuple[0]
+
+
+        return ClienteInDB(
+            id_cliente=new_id_cliente,
+            p_nombre=client.p_nombre,
+            s_nombre=client.s_nombre,
+            p_apellido=client.p_apellido,
+            s_apellido=client.s_apellido,
+            correo=client.correo,
+            telefono=client.telefono,
+            clave_hash=hashed_password,
+            activo='S'
+        )
+    except oracledb.Error as e:
+        error_obj, = e.args # Para obtener el objeto de error de Oracle
+        if db_conn: # Solo hacer rollback si la conexión existe
+            await asyncio.to_thread(db_conn.rollback)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error de base de datos al registrar cliente: {error_obj.message.strip()}"
+        )
+    except HTTPException as http_ex: # Re-lanzar HTTPExceptions para que FastAPI las maneje
+        raise http_ex
+    except Exception as ex: # Captura general para otros errores inesperados
+        if db_conn:
+            await asyncio.to_thread(db_conn.rollback)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error inesperado en el servidor: {str(ex)}"
+        )
     finally:
-        db.close()
+        if cursor:
+            await asyncio.to_thread(cursor.close)
+
+@app.post("/token", response_model=Token, summary="Obtener token de acceso para el login")
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db_conn: oracledb.Connection = Depends(get_conexion)):
+    cursor = None
+    try:
+        cursor = await asyncio.to_thread(db_conn.cursor)
+        await asyncio.to_thread(
+            cursor.execute,
+            """SELECT id_cliente, p_nombre, s_nombre, p_apellido, s_apellido, 
+                      correo, telefono, clave_hash, activo 
+               FROM cliente WHERE correo = :correo""",
+            correo=form_data.username
+        )
+        row = await asyncio.to_thread(cursor.fetchone)
+
+        if row is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Correo o contraseña incorrectos"
+            )
+        
+        user_data = {
+            "id_cliente": row[0], "p_nombre": row[1], "s_nombre": row[2],
+            "p_apellido": row[3], "s_apellido": row[4], "correo": row[5],
+            "telefono": row[6], "clave_hash": row[7], "activo": row[8]
+        }
+        user_in_db = ClienteInDB(**user_data)
+
+        if user_in_db.activo == 'N':
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Usuario inactivo"
+            )
+
+        if not verify_password(form_data.password, user_in_db.clave_hash):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Correo o contraseña incorrectos"
+            )
+
+        access_token_expires = timedelta(seconds=ACCESS_TOKEN_EXPIRE_SECONDS)
+        access_token = create_access_token(
+            data={"sub": user_in_db.correo}, expires_delta=access_token_expires
+        )
+        return {"access_token": access_token, "token_type": "bearer"}
+    except oracledb.Error as e:
+        error_obj, = e.args
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error de base de datos al intentar login: {error_obj.message.strip()}"
+        )
+    finally:
+        if cursor:
+            await asyncio.to_thread(cursor.close)
+
+@app.get("/users/me", response_model=ClienteInDB, summary="Obtener información del usuario actual")
+async def read_users_me(current_user: ClienteInDB = Depends(get_current_user)):
+    return current_user
