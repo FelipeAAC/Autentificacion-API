@@ -1,4 +1,3 @@
-import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 import oracledb
@@ -107,7 +106,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db_conn: oracled
     cursor = None
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        correo: str = payload.get("sub")
+        correo: Optional[str] = payload.get("sub")
         if correo is None:
             raise credentials_exception
         token_data = TokenData(correo=correo)
@@ -135,7 +134,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db_conn: oracled
     except oracledb.Error as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error de base de datos al obtener usuario: {e}"
+            detail=f"Error de base de datos al obtener usuario: {str(e)}"
         )
     finally:
         if cursor:
