@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 SECRET_KEY = "your-super-secret-key-replace-this-in-production-with-a-random-one"
 ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_SECONDS = 99999999
 
 async def get_conexion():
     try:
