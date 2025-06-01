@@ -70,6 +70,19 @@ class ClienteInDB(ClienteBase):
     class Config:
         from_attributes = True
 
+class ClientePublic(BaseModel):
+    id_cliente: int
+    p_nombre: str
+    s_nombre: Optional[str]
+    p_apellido: str
+    s_apellido: Optional[str]
+    correo: str
+    telefono: Optional[str]
+    activo: str
+
+    class Config:
+        from_attributes = True
+
 class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -140,7 +153,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db_conn: oracled
         if cursor:
             await asyncio.to_thread(cursor.close)
 
-@app.post("/register", response_model=ClienteInDB, status_code=status.HTTP_201_CREATED, summary="Registrar un nuevo cliente")
+@app.post("/register", response_model=ClientePublic, status_code=status.HTTP_201_CREATED, summary="Registrar un nuevo cliente")
 async def register_client(client: ClienteCreate, db_conn: oracledb.Connection = Depends(get_conexion)):
     cursor = None
     try:
@@ -192,7 +205,7 @@ async def register_client(client: ClienteCreate, db_conn: oracledb.Connection = 
         new_id_cliente = new_id_cliente_tuple[0]
 
 
-        return ClienteInDB(
+        return ClientePublic(
             id_cliente=new_id_cliente,
             p_nombre=client.p_nombre,
             s_nombre=client.s_nombre,
@@ -225,7 +238,10 @@ async def register_client(client: ClienteCreate, db_conn: oracledb.Connection = 
             await asyncio.to_thread(cursor.close)
 
 @app.post("/token", response_model=Token, summary="Obtener token de acceso para el login")
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db_conn: oracledb.Connection = Depends(get_conexion)):
+async def login_for_access_token(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db_conn: oracledb.Connection = Depends(get_conexion)
+):
     cursor = None
     try:
         cursor = await asyncio.to_thread(db_conn.cursor)
@@ -240,10 +256,10 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
 
         if row is None:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
+                status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Correo o contraseña incorrectos"
             )
-        
+
         user_data = {
             "id_cliente": row[0], "p_nombre": row[1], "s_nombre": row[2],
             "p_apellido": row[3], "s_apellido": row[4], "correo": row[5],
@@ -253,13 +269,13 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
 
         if user_in_db.activo == 'N':
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
+                status_code=status.HTTP_403_FORBIDDEN,
                 detail="Usuario inactivo"
             )
 
         if not verify_password(form_data.password, user_in_db.clave_hash):
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
+                status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Correo o contraseña incorrectos"
             )
 
@@ -278,6 +294,6 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
         if cursor:
             await asyncio.to_thread(cursor.close)
 
-@app.get("/users/me", response_model=ClienteInDB, summary="Obtener información del usuario actual")
+@app.get("/users/me", response_model=ClientePublic, summary="Obtener información del usuario actual")
 async def read_users_me(current_user: ClienteInDB = Depends(get_current_user)):
-    return current_user
+    return ClientePublic(**current_user.dict())
