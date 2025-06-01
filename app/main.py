@@ -8,6 +8,7 @@ from passlib.context import CryptContext
 from pydantic import BaseModel, Field
 import asyncio
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Body
 
 SECRET_KEY = "your-super-secret-key-replace-this-in-production-with-a-random-one"
 ALGORITHM = "HS256"
@@ -100,11 +101,12 @@ origins = [
     "http://localhost",
     "http://localhost:8000",
     "http://127.0.0.1:8000",
+    "http://127.0.0.1:8001",
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["http://127.0.0.1:8000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -204,7 +206,6 @@ async def register_client(client: ClienteCreate, db_conn: oracledb.Connection = 
              raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="No se pudo obtener el ID del cliente generado.")
         new_id_cliente = new_id_cliente_tuple[0]
 
-
         return ClientePublic(
             id_cliente=new_id_cliente,
             p_nombre=client.p_nombre,
@@ -213,9 +214,9 @@ async def register_client(client: ClienteCreate, db_conn: oracledb.Connection = 
             s_apellido=client.s_apellido,
             correo=client.correo,
             telefono=client.telefono,
-            clave_hash=hashed_password,
             activo='S'
         )
+    
     except oracledb.Error as e:
         error_obj, = e.args
         if db_conn:
@@ -283,7 +284,11 @@ async def login_for_access_token(
         access_token = create_access_token(
             data={"sub": user_in_db.correo}, expires_delta=access_token_expires
         )
-        return {"access_token": access_token, "token_type": "bearer"}
+        return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": ClientePublic(**user_in_db.dict())
+        }
     except oracledb.Error as e:
         error_obj, = e.args
         raise HTTPException(
@@ -296,4 +301,102 @@ async def login_for_access_token(
 
 @app.get("/users/me", response_model=ClientePublic, summary="Obtener información del usuario actual")
 async def read_users_me(current_user: ClienteInDB = Depends(get_current_user)):
+    print("Perfil entregado:", current_user.id_cliente, current_user.correo)
     return ClientePublic(**current_user.dict())
+
+@app.get("/users/by-email")
+async def get_user_by_email(correo: str, db_conn: oracledb.Connection = Depends(get_conexion)):
+    cursor = None
+    try:
+        cursor = await asyncio.to_thread(db_conn.cursor)
+        # Buscar primero en clientes
+        await asyncio.to_thread(
+            cursor.execute,
+            "SELECT id_cliente, correo, activo FROM cliente WHERE correo = :correo",
+            correo=correo
+        )
+        row = await asyncio.to_thread(cursor.fetchone)
+        if row:
+            return {
+                "id": row[0],
+                "correo": row[1],
+                "activo": row[2],
+                "rol": "Cliente"
+            }
+        # Buscar en empleados (JOIN con cargo)
+        await asyncio.to_thread(
+            cursor.execute,
+            """
+            SELECT e.id_empleado, e.correo, e.activo, c.descripcion
+            FROM empleado e
+            LEFT JOIN cargo c ON e.id_cargo = c.id_cargo
+            WHERE e.correo = :correo
+            """,
+            correo=correo
+        )
+        row = await asyncio.to_thread(cursor.fetchone)
+        if row:
+            cargo = (row[3] or "").lower()
+            if "admin" in cargo:
+                rol = "Administrador"
+            elif "bodeguero" in cargo:
+                rol = "Bodeguero"
+            elif "vendedor" in cargo:
+                rol = "Empleado"
+            else:
+                rol = "Empleado"
+            return {
+                "id": row[0],
+                "correo": row[1],
+                "activo": row[2],
+                "rol": rol
+            }
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    finally:
+        if cursor:
+            await asyncio.to_thread(cursor.close)
+            
+@app.post("/activar-cuenta")
+async def activar_cuenta(
+    correo: str = Body(...),
+    nueva_contrasena: str = Body(...),
+    db_conn: oracledb.Connection = Depends(get_conexion)
+):
+    cursor = None
+    try:
+        cursor = await asyncio.to_thread(db_conn.cursor)
+        await asyncio.to_thread(
+            cursor.execute,
+            "SELECT id_cliente FROM cliente WHERE correo = :correo",
+            correo=correo
+        )
+        row = await asyncio.to_thread(cursor.fetchone)
+        hashed_password = get_password_hash(nueva_contrasena)
+        if row:
+            await asyncio.to_thread(
+                cursor.execute,
+                "UPDATE cliente SET clave_hash = :clave_hash, activo = 'S' WHERE correo = :correo",
+                clave_hash=hashed_password,
+                correo=correo
+            )
+            await asyncio.to_thread(db_conn.commit)
+            return {"detail": "Cuenta de cliente activada y contraseña cambiada"}
+        await asyncio.to_thread(
+            cursor.execute,
+            "SELECT id_empleado FROM empleado WHERE correo = :correo",
+            correo=correo
+        )
+        row = await asyncio.to_thread(cursor.fetchone)
+        if row:
+            await asyncio.to_thread(
+                cursor.execute,
+                "UPDATE empleado SET clave_hash = :clave_hash, activo = 'S' WHERE correo = :correo",
+                clave_hash=hashed_password,
+                correo=correo
+            )
+            await asyncio.to_thread(db_conn.commit)
+            return {"detail": "Cuenta de empleado activada y contraseña cambiada"}
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    finally:
+        if cursor:
+            await asyncio.to_thread(cursor.close)
